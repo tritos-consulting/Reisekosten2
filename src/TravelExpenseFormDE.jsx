@@ -2,17 +2,17 @@
 import React, { useMemo, useRef, useState, useEffect } from "react";
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
+import Tesseract from "tesseract.js";
 
 /**
- * Enthält:
- * - 0,30 €/km (keine Staffel), KM aus Tachostand
- * - Pflichtfelder in Basisdaten (PDF-Button erst aktiv, wenn alles gefüllt)
- * - Drag&Drop + Entfernen-Button für Belege (Bilder & PDFs)
- * - PDF-Anhänge seitenfüllend A4, Bild-Kompression
- * - pdf.js-Lader (zuerst lokal /public/pdfjs, dann CDN-Fallback)
- * - Logo nur auf erster PDF-Seite (rechtsbündig, LOGO_RIGHT justierbar)
- * - Einheitliche, rechtsbündige Betragsspalten in allen Tabellen
- * - „📧 Email “-Button (Light-Variante, mailto:)
+ * Features:
+ * - 0,30 €/km (keine Staffel) + KM aus Tachostand
+ * - Responsive Layout, symmetrische Ränder
+ * - Upload: Bilder & PDFs, Drag&Drop, Entfernen-Button pro Anhang
+ * - PDF-Export komprimiert (JPEG), Logo auf erster Seite, Anhänge seitenfüllend A4
+ * - pdf.js Loader (lokal in /public/pdfjs + CDN-Fallback)
+ * - OCR (Tesseract.js): Beträge erkennen und automatisch zuordnen:
+ *   Deutsche Bahn / Taxi / Öffentliche Verkehrsmittel / Sonstige Auslagen (Fallback)
  */
 
 // --------- Design Tokens ----------
@@ -76,8 +76,8 @@ const CardTitle = ({ children }) => (
 const CardContent = ({ children }) => (
   <div
     style={{
-      paddingInline: 32,   // gleicher Abstand links & rechts
-      paddingBlock: 24,    // Abstand oben/unten
+      paddingInline: 32,
+      paddingBlock: 24,
       display: "grid",
       gap: 24,
       boxSizing: "border-box",
@@ -170,7 +170,7 @@ const Label = ({ children, htmlFor }) => (
 // ---------- Helpers ----------
 const fmt = (n) => (Number.isFinite(n) ? n : 0).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
 const num = (v) => {
-  const n = typeof v === "number" ? v : parseFloat(String(v ?? "").replace(",", "."));
+  const n = typeof v === "number" ? v : parseFloat(String(v ?? "").replace(/\./g, "").replace(",", "."));
   return Number.isFinite(n) ? n : 0;
 };
 function kwIsoFromDateStr(dateStr) {
@@ -197,9 +197,8 @@ const JPG_QUALITY_ATTACH = 0.72;// Anhänge
 
 // Logo (liegt in /public/logo.png)
 const LOGO_SRC = "logo.png";
-const LOGO_W = 180;     // Breite in pt
-const LOGO_H = 84;      // Höhe in pt
-const LOGO_RIGHT = 24;  // Abstand vom rechten Rand in pt (1 cm ≈ 28.35 pt)
+const LOGO_W = 180;  // pt
+const LOGO_H = 84;   // pt
 
 async function downscaleImage(dataUrl, targetWidthPx = TARGET_IMG_PX, quality = JPG_QUALITY_ATTACH) {
   return new Promise((resolve) => {
@@ -224,7 +223,7 @@ async function downscaleImage(dataUrl, targetWidthPx = TARGET_IMG_PX, quality = 
 // --------- pdf.js Loader: lokal, dann CDN ---------
 const PDFJS_VERSION = "3.11.174";
 const PDFJS_CANDIDATES = [
-  { lib: "pdfjs/pdf.min.js", worker: "pdfjs/pdf.worker.min.js" },
+  { lib: "pdfjs/pdf.min.js", worker: "pdfjs/pdf.worker.min.js" }, // <- /public/pdfjs/... empfohlen
   {
     lib: `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.js`,
     worker: `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.js`,
@@ -262,6 +261,45 @@ async function ensurePdfJs() {
     }
   }
   throw new Error(lastErr?.message || "pdf.js konnte nicht geladen werden.");
+}
+
+// ---------- OCR Helpers ----------
+async function ocrExtractTextFromDataUrl(dataUrl) {
+  const { data } = await Tesseract.recognize(dataUrl, "deu+eng");
+  return data.text || "";
+}
+
+function findAmountsInText(text) {
+  if (!text) return [];
+  // Zahlen wie 12,34 | 1.234,56 | 56.78
+  const matches = text.match(/\b\d{1,4}(?:[.,]\d{3})*(?:[.,]\d{2})\b/g) || [];
+  return matches
+    .map((s) => Number(String(s).replace(/\./g, "").replace(",", ".")))
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function detectCategory(text) {
+  const t = (text || "").toLowerCase();
+  const isBahn = /(deutsche\s*bahn|bahncard|db\b|ice|ic|ec|zugticket|zugfahrt)/.test(t);
+  const isTaxi = /\btaxi(es)?\b|fahrdienst|mytaxi|bolt|uber/.test(t);
+  const isOev = /(öpnv|oepnv|u-?bahn|s-?bahn|stra[ßss]enbahn|tram|bus\b|vvs|rmv|bvg|hvv|mvv)/.test(t);
+  if (isBahn) return "bahn";
+  if (isTaxi) return "taxi";
+  if (isOev) return "oev";
+  return "auslage";
+}
+
+function extractAmountAndCategory(text, mode = "largest") {
+  const amounts = findAmountsInText(text);
+  const category = detectCategory(text);
+  if (!amounts.length) return { amount: null, category, rawAmounts: [] };
+  if (mode === "sum") {
+    const total = amounts.reduce((a, b) => a + b, 0);
+    return { amount: total, category, rawAmounts: amounts };
+  }
+  // default: größter Betrag
+  const amount = amounts.sort((a, b) => b - a)[0];
+  return { amount, category, rawAmounts: amounts };
 }
 
 // Summen
@@ -315,6 +353,10 @@ export default function TravelExpenseFormDE() {
   const [isDragging, setIsDragging] = useState(false);
   const dropRef = useRef(null);
 
+  // OCR Status
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrMsg, setOcrMsg] = useState("");
+
   // ---------- Effects ----------
   useEffect(() => {
     if (basis.kwAuto && basis.beginn) {
@@ -341,28 +383,90 @@ export default function TravelExpenseFormDE() {
   const sumAuslagen = useMemo(() => computeSumAuslagen(auslagen), [auslagen]);
   const gesamt = useMemo(() => sumFahrt + sumVerpf + sumUebernacht + sumAuslagen, [sumFahrt, sumVerpf, sumUebernacht, sumAuslagen]);
 
-  // Pflichtfelder-Check
-  const basisOk = Boolean(basis.name && basis.zweck && basis.beginn && basis.ende && basis.firma);
+  // ---------- OCR Ergebnis ins Formular übernehmen ----------
+  function applyOcrResultToForm({ amount, category, filename, pageIndex }) {
+    if (!amount || !Number.isFinite(amount)) return;
 
-  // ---------- Handlers ----------
-  const addAuslage = () => setAuslagen((a) => [...a, { id: Date.now(), text: "", betrag: "" }]);
-  const delAuslage = (id) => setAuslagen((a) => a.filter((x) => x.id !== id));
+    if (category === "bahn") {
+      setFahrt((prev) => ({ ...prev, bahn: String((num(prev.bahn) + amount).toFixed(2)).replace(".", ",") }));
+      return;
+    }
+    if (category === "taxi") {
+      setFahrt((prev) => ({ ...prev, taxi: String((num(prev.taxi) + amount).toFixed(2)).replace(".", ",") }));
+      return;
+    }
+    if (category === "oev") {
+      setFahrt((prev) => ({ ...prev, oev: String((num(prev.oev) + amount).toFixed(2)).replace(".", ",") }));
+      return;
+    }
+    // Fallback: Sonstige Auslagen
+    setAuslagen((prev) => [
+      ...prev,
+      {
+        id: Date.now() + Math.random(),
+        text: `Beleg ${filename || ""}${Number.isFinite(pageIndex) ? ` (Seite ${pageIndex + 1})` : ""}`,
+        betrag: String(amount.toFixed(2)).replace(".", ","),
+      },
+    ]);
+  }
 
+  // ---------- Dateiannahme (Input & Drag&Drop) + OCR ----------
   const handleFiles = async (filesList) => {
     const files = Array.from(filesList || []);
     const next = [];
+
     for (const file of files) {
       if (file.type.startsWith("image/")) {
+        // Bild lesen
         const dataUrl = await new Promise((resolve) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result);
           reader.readAsDataURL(file);
         });
+
+        // Attachment hinzufügen
         next.push({ kind: "image", name: file.name, dataUrl });
+
+        // OCR (nicht blockierend – aber mit Visualisierung)
+        setOcrBusy(true);
+        setOcrMsg(`Beleg „${file.name}“ wird erkannt…`);
+        try {
+          const text = await ocrExtractTextFromDataUrl(dataUrl);
+          const { amount, category } = extractAmountAndCategory(text, "largest"); // oder "sum"
+          applyOcrResultToForm({ amount, category, filename: file.name });
+        } catch (e) {
+          console.warn("OCR Fehler (Bild):", e);
+        } finally {
+          setOcrBusy(false);
+          setOcrMsg("");
+        }
       } else if (file.type === "application/pdf") {
+        // PDF anhängen (für Export)
         next.push({ kind: "pdf", name: file.name, file });
+
+        // PDF -> Seiten rendern -> pro Seite OCR
+        setOcrBusy(true);
+        setOcrMsg(`PDF „${file.name}“ wird erkannt…`);
+        try {
+          const pages = await renderPdfFileToImages(file); // [{dataUrl, aspect}]
+          for (let i = 0; i < pages.length; i++) {
+            try {
+              const text = await ocrExtractTextFromDataUrl(pages[i].dataUrl);
+              const { amount, category } = extractAmountAndCategory(text, "largest");
+              applyOcrResultToForm({ amount, category, filename: file.name, pageIndex: i });
+            } catch (e) {
+              console.warn("OCR Fehler (PDF-Seite):", e);
+            }
+          }
+        } catch (e) {
+          console.warn("PDF rendern für OCR fehlgeschlagen:", e);
+        } finally {
+          setOcrBusy(false);
+          setOcrMsg("");
+        }
       }
     }
+
     if (next.length) setAttachments((prev) => [...prev, ...next]);
   };
 
@@ -395,6 +499,7 @@ export default function TravelExpenseFormDE() {
     }
   };
 
+  // PDF -> Bilder rendern (für OCR und beim Export)
   async function renderPdfFileToImages(file) {
     const pdfjsLib = await ensurePdfJs();
     const ab = await file.arrayBuffer();
@@ -424,6 +529,7 @@ export default function TravelExpenseFormDE() {
     return pages;
   }
 
+  // ---------- PDF-Erzeugung ----------
   const generatePDF = async () => {
     setErrMsg("");
     setPdfUrl("");
@@ -478,10 +584,10 @@ export default function TravelExpenseFormDE() {
       const imgMain = canvas.toDataURL("image/jpeg", JPG_QUALITY_MAIN);
       pdf.addImage(imgMain, "JPEG", (pageW - w) / 2, margin, w, h, undefined, "FAST");
 
-      // Logo nur auf der ersten Seite, rechtsbündig (LOGO_RIGHT)
+      // Logo nur auf der ERSTEN Seite (x-Position anpassen, falls weiter nach rechts gewünscht)
       if (logoImg) {
-        const x = pageW - LOGO_RIGHT - LOGO_W;
-        pdf.addImage(logoImg, "PNG", x, margin, LOGO_W, LOGO_H);
+        // Beispiel: 3 cm vom rechten Rand entfernt (~85 pt) -> x = pageW - 85 - LOGO_W
+        pdf.addImage(logoImg, "PNG", pageW - 85 - LOGO_W, margin, LOGO_W, LOGO_H);
       }
 
       // ---- Anhänge (A4, 1 pro Seite, Orientierung je Seite) ----
@@ -515,7 +621,7 @@ export default function TravelExpenseFormDE() {
         }
       }
 
-      // 3) Einfügen: je Bild eine A4-Seite, Orientierung passend (KEIN Logo auf Folgeseiten)
+      // 3) Einfügen: je Bild eine A4-Seite (ohne Logo)
       for (let i = 0; i < allImages.length; i++) {
         const { dataUrl, name } = allImages[i];
 
@@ -574,9 +680,9 @@ export default function TravelExpenseFormDE() {
     const pass = (name) => results.push({ name, ok: true });
     const fail = (name, msg) => results.push({ name, ok: false, msg });
     try {
-      const n1 = num("1,5");
-      if (Math.abs(n1 - 1.5) < 1e-9) pass("num parses '1,5'");
-      else fail("num parses '1,5'", `got ${n1}`);
+      const n1 = num("1.234,56");
+      if (Math.abs(n1 - 1234.56) < 1e-9) pass("num parses '1.234,56'");
+      else fail("num parses '1.234,56'", `got ${n1}`);
       const fahrtTest = { km: 100, oev: 10, bahn: 0, taxi: 0 };
       const sf = computeSumFahrt(fahrtTest);
       if (Math.abs(sf - 40) < 1e-9) pass("computeSumFahrt 0,30 €/km + ÖPNV");
@@ -599,7 +705,7 @@ export default function TravelExpenseFormDE() {
       style={{
         maxWidth: 1100,
         margin: "0 auto",
-        paddingInline: containerPadding, // symmetrisch links & rechts
+        paddingInline: containerPadding,
         paddingBlock: containerPadding,
         fontFamily:
           'Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"',
@@ -612,25 +718,7 @@ export default function TravelExpenseFormDE() {
         <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>Reisekostenabrechnung</h1>
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
           <Button variant="secondary" onClick={runTests}>🧪 Tests</Button>
-
-          <Button onClick={generatePDF} disabled={busy || !basisOk}>
-            {busy ? "⏳ Erzeuge PDF…" : "⬇️ PDF erzeugen"}
-          </Button>
-
-          {/* NEW: Light-Mailto Button */}
-          <Button
-            variant="secondary"
-            onClick={() => {
-              const kw = basis.kw || "XX";
-              const mailtoLink = `mailto:rechnungswesen@tritos-consulting.com?subject=${encodeURIComponent(
-                `Reisekosten KW ${kw}`
-              )}&body=${encodeURIComponent("Bitte die PDF-Reisekostenabrechnung im Anhang einfügen.")}`;
-              window.location.href = mailtoLink;
-            }}
-            title="Enail mit Betreff erstellen"
-          >
-            📧 Email
-          </Button>
+          <Button onClick={generatePDF} disabled={busy}>{busy ? "⏳ Erzeuge PDF…" : "⬇️ PDF erzeugen"}</Button>
         </div>
       </div>
 
@@ -640,12 +728,12 @@ export default function TravelExpenseFormDE() {
         <CardContent>
           <div style={{ display: "grid", gridTemplateColumns: cols(3, 2, 1), columnGap: colGap, rowGap: 24 }}>
             <div>
-              <Label htmlFor="name">Name*</Label>
-              <Input id="name" required value={basis.name} onChange={(e) => setBasis({ ...basis, name: e.target.value })} />
+              <Label htmlFor="name">Name</Label>
+              <Input id="name" value={basis.name} onChange={(e) => setBasis({ ...basis, name: e.target.value })} />
             </div>
             <div>
-              <Label htmlFor="zweck">Zweck*</Label>
-              <Input id="zweck" required placeholder="z.B. Beratung Hallesche" value={basis.zweck} onChange={(e) => setBasis({ ...basis, zweck: e.target.value })} />
+              <Label htmlFor="zweck">Zweck</Label>
+              <Input id="zweck" placeholder="z.B. Beratung Hallesche" value={basis.zweck} onChange={(e) => setBasis({ ...basis, zweck: e.target.value })} />
             </div>
             <div>
               <Label htmlFor="kw">Kalenderwoche {basis.kwAuto ? "(automatisch)" : "(manuell)"}</Label>
@@ -669,16 +757,16 @@ export default function TravelExpenseFormDE() {
               </div>
             </div>
             <div>
-              <Label htmlFor="beginn">Beginn*</Label>
-              <Input id="beginn" type="date" required value={basis.beginn} onChange={(e) => setBasis({ ...basis, beginn: e.target.value })} />
+              <Label htmlFor="beginn">Beginn</Label>
+              <Input id="beginn" type="date" value={basis.beginn} onChange={(e) => setBasis({ ...basis, beginn: e.target.value })} />
             </div>
             <div>
-              <Label htmlFor="ende">Ende*</Label>
-              <Input id="ende" type="date" required value={basis.ende} onChange={(e) => setBasis({ ...basis, ende: e.target.value })} />
+              <Label htmlFor="ende">Ende</Label>
+              <Input id="ende" type="date" value={basis.ende} onChange={(e) => setBasis({ ...basis, ende: e.target.value })} />
             </div>
             <div>
-              <Label htmlFor="firma">Firma*</Label>
-              <Input id="firma" required value={basis.firma} onChange={(e) => setBasis({ ...basis, firma: e.target.value })} />
+              <Label htmlFor="firma">Firma</Label>
+              <Input id="firma" value={basis.firma} onChange={(e) => setBasis({ ...basis, firma: e.target.value })} />
             </div>
           </div>
         </CardContent>
@@ -800,7 +888,7 @@ export default function TravelExpenseFormDE() {
         <CardHeader>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <CardTitle>Sonstige Auslagen</CardTitle>
-            <Button variant="secondary" onClick={addAuslage}>+ Position</Button>
+            <Button variant="secondary" onClick={() => setAuslagen((a) => [...a, { id: Date.now(), text: "", betrag: "" }])}>+ Position</Button>
           </div>
         </CardHeader>
         <CardContent>
@@ -830,7 +918,7 @@ export default function TravelExpenseFormDE() {
                 </div>
                 {auslagen.length > 1 && (
                   <div style={{ gridColumn: "1 / -1", marginTop: -4 }}>
-                    <Button variant="secondary" onClick={() => delAuslage(r.id)}>Entfernen</Button>
+                    <Button variant="secondary" onClick={() => setAuslagen((a) => a.filter((x) => x.id !== r.id))}>Entfernen</Button>
                   </div>
                 )}
               </div>
@@ -847,6 +935,13 @@ export default function TravelExpenseFormDE() {
       <Card>
         <CardHeader><CardTitle>Belege hochladen</CardTitle></CardHeader>
         <CardContent>
+          {/* OCR-Status */}
+          {(ocrBusy || ocrMsg) && (
+            <div style={{ fontSize: 12, color: "#2563EB" }}>
+              🔍 {ocrMsg || "Belege werden erkannt…"}
+            </div>
+          )}
+
           <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
             <Input
               id="file"
@@ -857,7 +952,7 @@ export default function TravelExpenseFormDE() {
               style={{ maxWidth: 480 }}
             />
             <div style={{ fontSize: 12, color: TOKENS.textMut }}>
-              Bilder & PDFs werden komprimiert und jeweils seitenfüllend auf DIN A4 angehängt.
+              Bilder & PDFs werden komprimiert und jeweils seitenfüllend auf DIN A4 angehängt. OCR liest Beträge automatisch aus.
             </div>
           </div>
 
@@ -954,25 +1049,17 @@ export default function TravelExpenseFormDE() {
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
             <div style={{ fontSize: 18, fontWeight: 700 }}>{fmt(gesamt)}</div>
             <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-              <Button onClick={generatePDF} disabled={busy || !basisOk}>
-                {busy ? "⏳ Erzeuge PDF…" : "⬇️ PDF erzeugen"}
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  const kw = basis.kw || "XX";
-                  const mailtoLink = `mailto:rechnungswesen@tritos-consulting.com?subject=${encodeURIComponent(
-                    `Reisekosten KW ${kw}`
-                  )}&body=${encodeURIComponent("Bitte die PDF-Reisekostenabrechnung im Anhang einfügen.")}`;
-                  window.location.href = mailtoLink;
-                }}
-              >
-                📧 Email 
-              </Button>
+              <Button onClick={generatePDF} disabled={busy}>{busy ? "⏳ Erzeuge PDF…" : "⬇️ PDF erzeugen"}</Button>
               {pdfUrl && (
                 <>
                   <a href={pdfUrl} target="_blank" rel="noreferrer" style={{ textDecoration: "none", fontSize: 14 }}>Vorschau öffnen</a>
-                  <a href={pdfUrl} download={`Reisekosten_${basis.name || "Mitarbeiter"}_KW${(basis.kw || "XX").replace("/", "-")}.pdf`} style={{ textDecoration: "none", fontSize: 14 }}>PDF herunterladen</a>
+                  <a
+                    href={pdfUrl}
+                    download={`Reisekosten_${basis.name || "Mitarbeiter"}_KW${(basis.kw || "XX").replace("/", "-")}.pdf`}
+                    style={{ textDecoration: "none", fontSize: 14 }}
+                  >
+                    PDF herunterladen
+                  </a>
                 </>
               )}
             </div>
@@ -995,7 +1082,7 @@ export default function TravelExpenseFormDE() {
           marginTop: 24,
         }}
       >
-        {/* Kopfbereich – Logo NICHT rendern (damit es nicht doppelt im PDF landet) */}
+        {/* Kopfbereich – Logo NICHT rendern (damit es nicht doppelt im PDF ist) */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div>
             <div style={{ fontSize: 12 }}>{basis.firma}</div>
@@ -1037,7 +1124,10 @@ export default function TravelExpenseFormDE() {
               <div style={header}>Fahrtkosten</div>
               <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
                 <colgroup>
-                  <col /><col /><col /><col />
+                  <col />
+                  <col />
+                  <col />
+                  <col />
                   <col style={{ width: 110 }} />
                 </colgroup>
                 <tbody>
@@ -1074,7 +1164,10 @@ export default function TravelExpenseFormDE() {
               <div style={header}>Verpflegungsmehraufwand</div>
               <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
                 <colgroup>
-                  <col /><col /><col /><col />
+                  <col />
+                  <col />
+                  <col />
+                  <col />
                   <col style={{ width: 110 }} />
                 </colgroup>
                 <tbody>
@@ -1110,7 +1203,10 @@ export default function TravelExpenseFormDE() {
               <div style={header}>Übernachtungskosten</div>
               <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
                 <colgroup>
-                  <col /><col /><col /><col />
+                  <col />
+                  <col />
+                  <col />
+                  <col />
                   <col style={{ width: 110 }} />
                 </colgroup>
                 <tbody>
@@ -1135,7 +1231,10 @@ export default function TravelExpenseFormDE() {
               <div style={header}>Sonstige Auslagen</div>
               <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
                 <colgroup>
-                  <col /><col /><col /><col />
+                  <col />
+                  <col />
+                  <col />
+                  <col />
                   <col style={{ width: 110 }} />
                 </colgroup>
                 <tbody>
@@ -1162,7 +1261,7 @@ export default function TravelExpenseFormDE() {
 
       {/* Hinweis */}
       <div style={{ fontSize: 12, color: TOKENS.textMut, marginTop: 8 }}>
-        📷 Tipp: Bilder & PDFs hier hochladen – sie landen automatisch (komprimiert) in der Export-PDF. Du kannst Dateien auch in das Feld ziehen.
+        📷 Tipp: Bilder & PDFs hier hochladen – sie landen automatisch (komprimiert) in der Export-PDF. Du kannst Dateien auch in das Feld ziehen. Die OCR versucht Beträge automatisch zu erkennen.
       </div>
 
       {/* Test results */}
