@@ -185,7 +185,7 @@ export default function TravelExpenseFormDE() {
 
   // Basis
   const [basis, setBasis] = useState({
-    name: "Kromer Tobias",
+    name: "",
     zweck: "",
     beginn: "",
     ende: "",
