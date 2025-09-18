@@ -4,10 +4,12 @@ import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
 
 /**
- * Änderungen:
- * - Optionaler, ausklappbarer Bereich für Abzüge (Frühstück/Mittag/Abend)
- * - Berechnung bleibt unverändert (berücksichtigt die Abzüge, wenn Werte > 0)
- * - Rest-Funktionalität: Upload Bilder/PDFs, Komprimierung, A4, Logo auf erster Seite, Tests, Pflichtfelder etc.
+ * Diese Version zeichnet das Deckblatt VEKTOBASIERT (echter Text) mit jsPDF
+ * → deutlich bessere OCR/Metadaten-Erkennung bei DATEV.
+ * - Dokumenteigenschaften (Titel/Keywords) + „Maschinenlese“-Zeile
+ * - Upload Bilder & PDFs, Downscaling/Kompression, je Anhang 1 Seite
+ * - Responsive UI, Pflichtfelder, Tests
+ * - Ausklappbarer Bereich für Abzüge (Frühstück/Mittag/Abend)
  */
 
 const TOKENS = {
@@ -35,6 +37,7 @@ function useWindowWidth() {
 const isTablet = (w) => w >= 768 && w < 1024;
 const isDesktop = (w) => w >= 1024;
 
+// ---- UI primitives
 const Card = ({ children }) => (
   <div style={{ border: `1px solid ${TOKENS.border}`, borderRadius: TOKENS.radius + 4, boxShadow: "0 8px 24px rgba(15,23,42,0.06)", overflow: "hidden", background: TOKENS.bgCard }}>
     {children}
@@ -44,17 +47,7 @@ const CardHeader = ({ children }) => <div style={{ padding: 20, borderBottom: `1
 const CardTitle = ({ children }) => <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: 0.2 }}>{children}</div>;
 const CardContent = ({ children }) => <div style={{ paddingInline: 32, paddingBlock: 24, display: "grid", gap: 24, boxSizing: "border-box" }}>{children}</div>;
 const Button = ({ children, onClick, variant = "primary", style, disabled, title, ariaLabel }) => {
-  const base = {
-    height: 40,
-    padding: "0 14px",
-    borderRadius: TOKENS.radius,
-    border: "1px solid transparent",
-    cursor: disabled ? "not-allowed" : "pointer",
-    fontWeight: 600,
-    fontSize: 14,
-    letterSpacing: 0.2,
-    transition: "all .15s ease",
-  };
+  const base = { height: 40, padding: "0 14px", borderRadius: TOKENS.radius, border: "1px solid transparent", cursor: disabled ? "not-allowed" : "pointer", fontWeight: 600, fontSize: 14, letterSpacing: 0.2, transition: "all .15s ease" };
   const variants = {
     primary: { background: disabled ? "#9CA3AF" : TOKENS.primary, color: "#fff", borderColor: TOKENS.primary },
     secondary: { background: "#FFFFFF", color: TOKENS.text, borderColor: TOKENS.border },
@@ -68,12 +61,8 @@ const Button = ({ children, onClick, variant = "primary", style, disabled, title
       title={title}
       aria-label={ariaLabel || title}
       style={{ ...base, ...variants[variant], ...style }}
-      onMouseEnter={(e) => {
-        if (variant === "primary" && !disabled) e.currentTarget.style.background = TOKENS.primaryHover;
-      }}
-      onMouseLeave={(e) => {
-        if (variant === "primary" && !disabled) e.currentTarget.style.background = TOKENS.primary;
-      }}
+      onMouseEnter={(e) => { if (variant === "primary" && !disabled) e.currentTarget.style.background = TOKENS.primaryHover; }}
+      onMouseLeave={(e) => { if (variant === "primary" && !disabled) e.currentTarget.style.background = TOKENS.primary; }}
     >
       {children}
     </button>
@@ -83,25 +72,13 @@ const Input = ({ style, ...props }) => (
   <input
     {...props}
     style={{
-      width: "100%",
-      height: 34,
-      padding: "6px 8px",
-      borderRadius: TOKENS.radius,
-      border: `1px solid ${TOKENS.border}`,
-      outline: "none",
-      fontSize: 14,
-      transition: "box-shadow .15s ease, border-color .15s ease",
-      background: "#FFFFFF",
-      ...style,
+      width: "100%", height: 34, padding: "6px 8px",
+      borderRadius: TOKENS.radius, border: `1px solid ${TOKENS.border}`,
+      outline: "none", fontSize: 14, transition: "box-shadow .15s ease, border-color .15s ease",
+      background: "#FFFFFF", ...style,
     }}
-    onFocus={(e) => {
-      e.currentTarget.style.borderColor = TOKENS.focus;
-      e.currentTarget.style.boxShadow = "0 0 0 3px rgba(37,99,235,0.2)";
-    }}
-    onBlur={(e) => {
-      e.currentTarget.style.borderColor = TOKENS.border;
-      e.currentTarget.style.boxShadow = "none";
-    }}
+    onFocus={(e) => { e.currentTarget.style.borderColor = TOKENS.focus; e.currentTarget.style.boxShadow = "0 0 0 3px rgba(37,99,235,0.2)"; }}
+    onBlur={(e) => { e.currentTarget.style.borderColor = TOKENS.border; e.currentTarget.style.boxShadow = "none"; }}
   />
 );
 const Label = ({ children, htmlFor }) => (
@@ -121,7 +98,7 @@ function kwIsoFromDateStr(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
   if (isNaN(d)) return "";
   const dt = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
-  const dayNum = (dt.getUTCDay() + 6) % 7 + 1;
+  const dayNum = (dt.getUTCDay() + 6) % 7 + 1; // 1..7 (Mo..So)
   dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
   const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
   const week = Math.ceil(((dt - yearStart) / 86400000 + 1) / 7);
@@ -133,12 +110,12 @@ function kmFlatCost(km, rate = 0.30) {
   return k * rate;
 }
 
-// --- Kompression ---
+// --- Kompression/Anhang ---
 const TARGET_IMG_PX = 1360;
 const JPG_QUALITY_MAIN = 0.78;
 const JPG_QUALITY_ATTACH = 0.72;
 
-const LOGO_SRC = "logo.png";
+const LOGO_SRC = "logo.png"; // lege dein Logo in /public/logo.png
 const LOGO_W = 180;
 const LOGO_H = 84;
 const LOGO_RIGHT = 24;
@@ -198,6 +175,28 @@ async function downscaleImage(dataUrl, targetWidthPx = TARGET_IMG_PX, quality = 
   });
 }
 
+async function renderPdfFileToImages(file) {
+  const pdfjsLib = await ensurePdfJs();
+  const ab = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const vp1 = page.getViewport({ scale: 1 });
+    const aspect = vp1.height / vp1.width;
+    const targetW = TARGET_IMG_PX;
+    const scale = targetW / vp1.width;
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = Math.round(targetW * aspect);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport, intent: "print" }).promise;
+    pages.push({ dataUrl: canvas.toDataURL("image/jpeg", JPG_QUALITY_ATTACH), aspect });
+  }
+  return pages;
+}
+
+// Summen
 const computeSumFahrt = (fahrt) => kmFlatCost(fahrt.km, 0.30) + num(fahrt.oev) + num(fahrt.bahn) + num(fahrt.taxi);
 const computeSumVerpf = (v) =>
   Math.max(
@@ -211,9 +210,75 @@ const computeSumVerpf = (v) =>
 const computeSumUebernacht = (u) => num(u.tatsaechlich) + num(u.pauschale);
 const computeSumAuslagen = (arr) => (arr || []).reduce((acc, r) => acc + num(r.betrag), 0);
 
+// ===== PDF Deckblatt-Helper (Text/Tabellen, vektor-basiert) =====
+const MARGIN = 24;          // Seitenrand (pt)
+const LINE_H = 14;          // Tabellen-Zeilenhöhe
+const TABLE_FONT = 11;
+const H_FONT = 12;
+
+function drawHeader(pdf, basis, pageW) {
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(10);
+  pdf.text(basis.firma || "", MARGIN, MARGIN + 2);
+
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(18);
+  pdf.text("Reisekostenabrechnung", MARGIN, MARGIN + 22);
+
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(10);
+  const sub = `${basis.kw ? `KW ${basis.kw} – ` : ""}${basis.name || ""}`;
+  pdf.text(sub, MARGIN, MARGIN + 36);
+}
+function drawLogo(pdf, imgEl, pageW) {
+  if (!imgEl) return;
+  const x = pageW - LOGO_RIGHT - LOGO_W;
+  pdf.addImage(imgEl, "PNG", x, MARGIN, LOGO_W, LOGO_H);
+}
+function drawKeyValueBlock(pdf, rows, x, y) {
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(10);
+  let cy = y;
+  rows.forEach(([label, value]) => {
+    pdf.setFont("helvetica", "bold");
+    pdf.text(`${label}:`, x, cy);
+    pdf.setFont("helvetica", "normal");
+    pdf.text(String(value || "—"), x + 50, cy);
+    cy += LINE_H;
+  });
+  return cy;
+}
+function drawTableHeader(pdf, title, x, y) {
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(H_FONT);
+  pdf.text(title, x, y);
+  return y + 6;
+}
+function drawRow(pdf, colTexts, colXs, y, isBold = false, rightAlignMask = []) {
+  pdf.setFont("helvetica", isBold ? "bold" : "normal");
+  pdf.setFontSize(TABLE_FONT);
+  for (let i = 0; i < colTexts.length; i++) {
+    const txt = String(colTexts[i] ?? "");
+    const x = colXs[i];
+    if (rightAlignMask[i]) {
+      const w = pdf.getTextWidth(txt);
+      pdf.text(txt, x - 2, y); // rechtsbündig (x ist rechte Kante)
+    } else {
+      pdf.text(txt, x, y);
+    }
+  }
+}
+function drawHLine(pdf, x1, x2, y) {
+  pdf.setLineWidth(0.3);
+  pdf.line(x1, y, x2, y);
+}
+function euro(n) { return fmt(num(n)); }
+
+// ===== Komponente =====
 export default function TravelExpenseFormDE() {
   const width = useWindowWidth();
 
+  // ---------- State ----------
   const [basis, setBasis] = useState({
     name: "Kromer Tobias",
     zweck: "",
@@ -240,25 +305,27 @@ export default function TravelExpenseFormDE() {
     satz24: 28,
     abzFruehstueck: 5.6,
     mittagAbz: 0,
-    abzMittag: 11.2,  // Default-Beispiel: 40% von 28€
+    abzMittag: 11.2,
     abendAbz: 0,
-    abzAbend: 11.2,   // Default-Beispiel: 40% von 28€
+    abzAbend: 11.2,
   });
   const [uebernacht, setUebernacht] = useState({ tatsaechlich: "", pauschale: "" });
   const [auslagen, setAuslagen] = useState([{ id: 1, text: "", betrag: "" }]);
-  const [attachments, setAttachments] = useState([]); // {kind:'image'|'pdf', name, dataUrl?|file?}
+  // attachments: {kind:'image'|'pdf', name, dataUrl?|file?}
+  const [attachments, setAttachments] = useState([]);
   const [pdfUrl, setPdfUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [errMsg, setErrMsg] = useState("");
   const [testOutput, setTestOutput] = useState([]);
 
-  // NEW: Toggle für ausklappbare Abzüge
+  // Ausklappbarer Bereich für Abzüge
   const [showDeductions, setShowDeductions] = useState(false);
 
+  // Drag & Drop
   const [isDragging, setIsDragging] = useState(false);
   const dropRef = useRef(null);
-  const printableRef = useRef(null);
 
+  // ---------- Effects ----------
   useEffect(() => {
     if (basis.kwAuto && basis.beginn) {
       const kw = kwIsoFromDateStr(basis.beginn);
@@ -276,6 +343,7 @@ export default function TravelExpenseFormDE() {
     if (String(diff) !== String(fahrt.km)) setFahrt((prev) => ({ ...prev, km: String(diff) }));
   }, [fahrt.tachostandBeginn, fahrt.tachostandEnde]);
 
+  // ---------- Memos ----------
   const kilometergeld = useMemo(() => kmFlatCost(fahrt.km, 0.30), [fahrt.km]);
   const sumFahrt = useMemo(() => computeSumFahrt(fahrt), [fahrt]);
   const sumVerpf = useMemo(() => computeSumVerpf(verpf), [verpf]);
@@ -285,6 +353,7 @@ export default function TravelExpenseFormDE() {
 
   const basisOk = Boolean(basis.name && basis.zweck && basis.beginn && basis.ende && basis.firma);
 
+  // ---------- Handlers ----------
   const addAuslage = () => setAuslagen((a) => [...a, { id: Date.now(), text: "", betrag: "" }]);
   const delAuslage = (id) => setAuslagen((a) => a.filter((x) => x.id !== id));
 
@@ -312,79 +381,134 @@ export default function TravelExpenseFormDE() {
   const onDragLeave = (e) => { e.preventDefault(); e.stopPropagation(); if (dropRef.current && !dropRef.current.contains(e.relatedTarget)) setIsDragging(false); };
   const onDrop = async (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); if (e.dataTransfer?.files?.length) await handleFiles(e.dataTransfer.files); };
 
-  async function ensurePdfJsReady() {
-    return ensurePdfJs();
-  }
-
-  async function renderPdfFileToImages(file) {
-    const pdfjsLib = await ensurePdfJsReady();
-    const ab = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
-    const pages = [];
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const vp1 = page.getViewport({ scale: 1 });
-      const aspect = vp1.height / vp1.width;
-      const targetW = TARGET_IMG_PX;
-      const scale = targetW / vp1.width;
-      const viewport = page.getViewport({ scale });
-      const canvas = document.createElement("canvas");
-      canvas.width = targetW;
-      canvas.height = Math.round(targetW * aspect);
-      await page.render({ canvasContext: canvas.getContext("2d"), viewport, intent: "print" }).promise;
-      pages.push({ dataUrl: canvas.toDataURL("image/jpeg", JPG_QUALITY_ATTACH), aspect });
-    }
-    return pages;
-  }
-
-  async function downscale(dataUrl, targetWidthPx = TARGET_IMG_PX, q = JPG_QUALITY_ATTACH) {
-    return downscaleImage(dataUrl, targetWidthPx, q);
-  }
-
+  // ===== generatePDF: vektorbasierte Deckblatt-Seite + Anhang-Seiten =====
   const generatePDF = async () => {
     setErrMsg("");
     setPdfUrl("");
     try {
-      const node = printableRef.current;
-      if (!node) return;
       setBusy(true);
 
-      const prev = { position: node.style.position, left: node.style.left, top: node.style.top, opacity: node.style.opacity, pointerEvents: node.style.pointerEvents };
-      node.style.position = "absolute"; node.style.left = "-10000px"; node.style.top = "0"; node.style.opacity = "1"; node.style.pointerEvents = "none";
-
-      const canvas = await html2canvas(node, { scale: 1.3, useCORS: true, backgroundColor: "#ffffff", imageTimeout: 15000 });
-      Object.assign(node.style, prev);
-
-      const logoImg = await new Promise((resolve) => { const img = new Image(); img.onload = () => resolve(img); img.onerror = () => resolve(null); img.src = LOGO_SRC; });
+      // Logo laden
+      const logoImg = await new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = LOGO_SRC;
+      });
 
       const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
       const pageW = pdf.internal.pageSize.getWidth();
-      const pageH = pdf.internal.pageSize.getHeight();
-      const margin = 24;
-      const innerW = pageW - margin * 2;
-      const innerH = pageH - margin * 2;
-      const ratio = Math.min(innerW / canvas.width, innerH / canvas.height);
-      const w = canvas.width * ratio;
-      const h = canvas.height * ratio;
-      const imgMain = canvas.toDataURL("image/jpeg", JPG_QUALITY_MAIN);
-      pdf.addImage(imgMain, "JPEG", (pageW - w) / 2, margin, w, h, undefined, "FAST");
 
-      if (logoImg) {
-        const x = pageW - LOGO_RIGHT - LOGO_W;
-        pdf.addImage(logoImg, "PNG", x, margin, LOGO_W, LOGO_H);
-      }
+      // Dokumenteigenschaften (für OCR/Erkennung)
+      const belegName = `Reisekosten_${basis.name || "Mitarbeiter"}_KW${(basis.kw || "XX").replace("/", "-")}`;
+      pdf.setProperties({
+        title: belegName,
+        subject: "Reisekostenabrechnung",
+        keywords: `Reisekosten, ${basis.name || ""}, ${basis.kw || ""}, ${basis.firma || ""}`,
+        creator: "Reisekosten Webformular",
+      });
 
+      // Unsichtbare Maschinenlese-Zeile (weiß)
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(1);
+      pdf.text(`DOC_NAME:${belegName} TOTAL_EUR:${euro(gesamt).replace(/\s/g, "")}`, MARGIN, 8);
+      pdf.setTextColor(0, 0, 0);
+
+      // === Deckblatt zeichnen ===
+      drawHeader(pdf, basis, pageW);
+      drawLogo(pdf, logoImg, pageW);
+
+      let y = MARGIN + 56;
+      const leftEndY = drawKeyValueBlock(pdf, [["Name", basis.name], ["Zweck", basis.zweck]], MARGIN, y);
+      const rightEndY = drawKeyValueBlock(pdf, [["Beginn", basis.beginn], ["Ende", basis.ende]], MARGIN + 280, y);
+      y = Math.max(leftEndY, rightEndY) + 6;
+
+      // Tabellenbreite, Spalten (Text/Text/Text/Text/Betrag rechts)
+      const x = MARGIN;
+      const w = pdf.internal.pageSize.getWidth() - MARGIN * 2;
+      const colXs = [x, x + 150, x + 330, x + 480, x + w - 2];
+
+      // Fahrtkosten
+      y = drawTableHeader(pdf, "Fahrtkosten", x, y + 10);
+      drawHLine(pdf, x, x + w, y + 4);
+      let rowY = y + 18;
+
+      const km = num(fahrt.km);
+      const kmCost = kmFlatCost(km, 0.30);
+
+      drawRow(pdf, ["Privat-PKW", `Kennzeichen: ${fahrt.kennzeichen || "—"}`, `Tachostand: ${fahrt.tachostandBeginn || "—"} → ${fahrt.tachostandEnde || "—"}`, `${km} km × 0,30 €/km`, euro(kmCost)], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawRow(pdf, ["Deutsche Bahn", "", "", "", euro(fahrt.bahn)], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawRow(pdf, ["Taxi", "", "", "", euro(fahrt.taxi)], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawRow(pdf, ["Öffentliche Verkehrsmittel", "", "", "", euro(fahrt.oev)], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+
+      drawHLine(pdf, x, x + w, rowY + 4); rowY += LINE_H;
+      drawRow(pdf, ["Zwischensumme Fahrtkosten", "", "", "", euro(sumFahrt)], colXs, rowY, true, [false,false,false,false,true]);
+      y = rowY + 10;
+
+      // Verpflegung
+      y = drawTableHeader(pdf, "Verpflegungsmehraufwand", x, y + 10);
+      drawHLine(pdf, x, x + w, y + 4);
+      rowY = y + 18;
+
+      drawRow(pdf, ["Tage > 8 Std.", String(verpf.tage8), `Satz ${euro(verpf.satz8)}`, "", euro(num(verpf.tage8) * num(verpf.satz8))], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawRow(pdf, ["Tage 24 Std.", String(verpf.tage24), `Satz ${euro(verpf.satz24)}`, "", euro(num(verpf.tage24) * num(verpf.satz24))], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+
+      const abzugFr = num(verpf.fruehstueckAbz) * num(verpf.abzFruehstueck);
+      const abzugMi = num(verpf.mittagAbz) * num(verpf.abzMittag);
+      const abzugAb = num(verpf.abendAbz) * num(verpf.abzAbend);
+
+      drawRow(pdf, ["abzgl. Frühstück", String(verpf.fruehstueckAbz), `${euro(verpf.abzFruehstueck)} pro Frühstück`, "", `- ${euro(abzugFr)}`], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawRow(pdf, ["abzgl. Mittagessen", String(verpf.mittagAbz), `${euro(verpf.abzMittag)} pro Mittagessen`, "", `- ${euro(abzugMi)}`], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawRow(pdf, ["abzgl. Abendessen", String(verpf.abendAbz), `${euro(verpf.abzAbend)} pro Abendessen`, "", `- ${euro(abzugAb)}`], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+
+      drawHLine(pdf, x, x + w, rowY + 4); rowY += LINE_H;
+      drawRow(pdf, ["Zwischensumme", "", "", "", euro(sumVerpf)], colXs, rowY, true, [false,false,false,false,true]);
+      y = rowY + 10;
+
+      // Übernachtung
+      y = drawTableHeader(pdf, "Übernachtungskosten", x, y + 10);
+      drawHLine(pdf, x, x + w, y + 4);
+      rowY = y + 18;
+      drawRow(pdf, ["Tatsächliche Kosten (ohne Verpflegung)", "", "", "", euro(uebernacht.tatsaechlich)], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawRow(pdf, ["Pauschale", "", "", "", euro(uebernacht.pauschale)], colXs, rowY, false, [false,false,false,false,true]); rowY += LINE_H;
+      drawHLine(pdf, x, x + w, rowY + 4); rowY += LINE_H;
+      drawRow(pdf, ["Zwischensumme", "", "", "", euro(sumUebernacht)], colXs, rowY, true, [false,false,false,false,true]);
+      y = rowY + 10;
+
+      // Auslagen
+      y = drawTableHeader(pdf, "Sonstige Auslagen", x, y + 10);
+      drawHLine(pdf, x, x + w, y + 4);
+      rowY = y + 18;
+      (auslagen || []).forEach((r) => {
+        drawRow(pdf, [r.text || "—", "", "", "", euro(r.betrag)], colXs, rowY, false, [false,false,false,false,true]);
+        rowY += LINE_H;
+      });
+      drawHLine(pdf, x, x + w, rowY + 4); rowY += LINE_H;
+      drawRow(pdf, ["Zwischensumme", "", "", "", euro(sumAuslagen)], colXs, rowY, true, [false,false,false,false,true]);
+      y = rowY + 14;
+
+      // Gesamtsumme (rechts)
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(12);
+      const totalTxt = `Gesamte Reisekosten: ${euro(gesamt)}`;
+      const totalW = pdf.getTextWidth(totalTxt);
+      pdf.text(totalTxt, x + w - totalW, y);
+
+      // === Anhänge (Bilder & PDFs → Seiten) ===
       const allImages = [];
       let pdfRenderFailed = false;
 
+      // Bilder (downscalen)
       for (const att of attachments) {
         if (att.kind === "image") {
           try {
-            const small = await downscale(att.dataUrl, TARGET_IMG_PX, JPG_QUALITY_ATTACH);
+            const small = await downscaleImage(att.dataUrl, TARGET_IMG_PX, JPG_QUALITY_ATTACH);
             allImages.push({ dataUrl: small, name: att.name });
           } catch (e) { console.error("Bildanhang Fehler:", att.name, e); }
         }
       }
+      // PDFs als Bilder rendern
       for (const att of attachments) {
         if (att.kind === "pdf") {
           try {
@@ -406,13 +530,15 @@ export default function TravelExpenseFormDE() {
         const s = Math.min(maxW / dim.w, maxH / dim.h);
         const drawW = dim.w * s;
         const drawH = dim.h * s;
-        const x = (curW - drawW) / 2;
-        const y = (curH - drawH) / 2;
-        pdf.addImage(dataUrl, "JPEG", x, y, drawW, drawH, undefined, "FAST");
-        pdf.setFontSize(9); pdf.text(name || "Anhang", m, curH - m / 2);
+        const cx = (curW - drawW) / 2;
+        const cy = (curH - drawH) / 2;
+        pdf.addImage(dataUrl, "JPEG", cx, cy, drawW, drawH, undefined, "FAST");
+        pdf.setFont("helvetica", "normal"); pdf.setFontSize(9);
+        pdf.text(name || "Anhang", m, curH - m / 2);
       }
 
-      const filename = `Reisekosten_${basis.name || "Mitarbeiter"}_KW${(basis.kw || "XX").replace("/", "-")}.pdf`;
+      // Download + Preview
+      const filename = `${belegName}.pdf`;
       try { pdf.save(filename, { returnPromise: true }); } catch {}
       const blob = pdf.output("blob");
       setPdfUrl(URL.createObjectURL(blob));
@@ -425,7 +551,7 @@ export default function TravelExpenseFormDE() {
     }
   };
 
-  // Tests inkl. Abzüge
+  // ---------- Tests ----------
   const runTests = () => {
     const results = [];
     const pass = (name) => results.push({ name, ok: true });
@@ -434,17 +560,19 @@ export default function TravelExpenseFormDE() {
       const n1 = num("1,5"); Math.abs(n1 - 1.5) < 1e-9 ? pass("num('1,5')") : fail("num('1,5')", n1);
       const sf = computeSumFahrt({ km: 100, oev: 10, bahn: 0, taxi: 0 }); Math.abs(sf - 40) < 1e-9 ? pass("Fahrt 100km + 10€") : fail("Fahrt", sf);
       const sv = computeSumVerpf({ tage8: 2, satz8: 14, tage24: 1, satz24: 28, fruehstueckAbz: 1, abzFruehstueck: 5.6, mittagAbz: 1, abzMittag: 11.2, abendAbz: 1, abzAbend: 11.2 });
-      Math.abs(sv - 28) < 1e-9 ? pass("Verpflegung inkl. Frühstück/Mittag/Abend Abzüge") : fail("Verpflegung-Abzüge", sv);
+      Math.abs(sv - 28) < 1e-9 ? pass("Verpflegung inkl. F/M/A-Abzüge") : fail("Verpflegung-Abzüge", sv);
       const svFloor = computeSumVerpf({ tage8: 0, satz8: 14, tage24: 0, satz24: 28, fruehstueckAbz: 10, abzFruehstueck: 100, mittagAbz: 5, abzMittag: 100, abendAbz: 3, abzAbend: 100 });
       svFloor === 0 ? pass("Verpflegung nie negativ") : fail("Verpflegung nie negativ", svFloor);
       setTestOutput(results);
     } catch (e) { setTestOutput([{ name: "Test runner crashed", ok: false, msg: String(e) }]); }
   };
 
+  // ---------- Layout helpers ----------
   const containerPadding = isDesktop(width) ? 56 : isTablet(width) ? 40 : 24;
   const colGap = isDesktop(width) ? 28 : isTablet(width) ? 24 : 20;
   const cols = (desktop, tablet, mobile) => (isDesktop(width) ? `repeat(${desktop}, minmax(0,1fr))` : isTablet(width) ? `repeat(${tablet}, minmax(0,1fr))` : `repeat(${mobile}, minmax(0,1fr))`);
 
+  // ---------- Render ----------
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", paddingInline: containerPadding, paddingBlock: containerPadding, fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"', color: TOKENS.text, background: TOKENS.bgApp, boxSizing: "border-box" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 20 }}>
@@ -507,327 +635,8 @@ export default function TravelExpenseFormDE() {
         </CardContent>
       </Card>
 
-      {/* Verpflegung */}
+      {/* Verpflegung (mit ausklappbaren Abzügen) */}
       <div style={{ height: 18 }} />
       <Card>
         <CardHeader><CardTitle>Verpflegungsmehraufwand</CardTitle></CardHeader>
-        <CardContent>
-          {/* Hauptwerte */}
-          <div style={{ display: "grid", gridTemplateColumns: cols(2, 2, 1), columnGap: colGap, rowGap: 24 }}>
-            <div><Label>Tage &gt; 8 Std.</Label><Input inputMode="numeric" value={verpf.tage8} onChange={(e) => setVerpf({ ...verpf, tage8: e.target.value })} /></div>
-            <div><Label>Satz (€/Tag)</Label><Input inputMode="decimal" value={verpf.satz8} onChange={(e) => setVerpf({ ...verpf, satz8: e.target.value })} /></div>
-            <div><Label>Tage 24 Std.</Label><Input inputMode="numeric" value={verpf.tage24} onChange={(e) => setVerpf({ ...verpf, tage24: e.target.value })} /></div>
-            <div><Label>Satz (€/Tag)</Label><Input inputMode="decimal" value={verpf.satz24} onChange={(e) => setVerpf({ ...verpf, satz24: e.target.value })} /></div>
-          </div>
-
-          {/* Toggle optionaler Abzüge */}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 4 }}>
-            <div style={{ fontSize: 12, color: TOKENS.textMut }}>Optional: Abzüge für Frühstück, Mittag- und Abendessen</div>
-            <Button
-              variant="secondary"
-              aria-expanded={showDeductions}
-              onClick={() => setShowDeductions((s) => !s)}
-              style={{ height: 32, padding: "0 10px" }}
-              title={showDeductions ? "Optionale Abzüge ausblenden" : "Optionale Abzüge anzeigen"}
-            >
-              {showDeductions ? "▼ Ausblenden" : "▶ Anzeigen"}
-            </Button>
-          </div>
-
-          {/* Ausklappbarer Bereich */}
-          <div
-            style={{
-              overflow: "hidden",
-              transition: "max-height .24s ease",
-              maxHeight: showDeductions ? 500 : 0,
-            }}
-            aria-hidden={!showDeductions}
-          >
-            <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: cols(2, 2, 1), columnGap: colGap, rowGap: 24 }}>
-              {/* Frühstück */}
-              <div><Label>abzgl. Frühstück (Anzahl)</Label><Input inputMode="numeric" value={verpf.fruehstueckAbz} onChange={(e) => setVerpf({ ...verpf, fruehstueckAbz: e.target.value })} /></div>
-              <div><Label>Abzug pro Frühstück (€)</Label><Input inputMode="decimal" value={verpf.abzFruehstueck} onChange={(e) => setVerpf({ ...verpf, abzFruehstueck: e.target.value })} /></div>
-              {/* Mittag */}
-              <div><Label>abzgl. Mittagessen (Anzahl)</Label><Input inputMode="numeric" value={verpf.mittagAbz} onChange={(e) => setVerpf({ ...verpf, mittagAbz: e.target.value })} /></div>
-              <div><Label>Abzug pro Mittagessen (€)</Label><Input inputMode="decimal" value={verpf.abzMittag} onChange={(e) => setVerpf({ ...verpf, abzMittag: e.target.value })} /></div>
-              {/* Abend */}
-              <div><Label>abzgl. Abendessen (Anzahl)</Label><Input inputMode="numeric" value={verpf.abendAbz} onChange={(e) => setVerpf({ ...verpf, abendAbz: e.target.value })} /></div>
-              <div><Label>Abzug pro Abendessen (€)</Label><Input inputMode="decimal" value={verpf.abzAbend} onChange={(e) => setVerpf({ ...verpf, abzAbend: e.target.value })} /></div>
-            </div>
-          </div>
-
-          <div style={{ fontSize: 12, color: TOKENS.textMut, marginTop: 8 }}>
-            Zwischensumme: <span style={{ fontWeight: 600, color: TOKENS.text }}>{fmt(sumVerpf)}</span>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Übernachtung */}
-      <div style={{ height: 18 }} />
-      <Card>
-        <CardHeader><CardTitle>Übernachtungskosten</CardTitle></CardHeader>
-        <CardContent>
-          <div style={{ display: "grid", gridTemplateColumns: cols(2, 2, 1), columnGap: colGap, rowGap: 24 }}>
-            <div><Label>Tatsächliche Kosten (ohne Verpflegung)</Label><Input inputMode="decimal" value={uebernacht.tatsaechlich} onChange={(e) => setUebernacht({ ...uebernacht, tatsaechlich: e.target.value })} /></div>
-            <div><Label>Pauschale</Label><Input inputMode="decimal" value={uebernacht.pauschale} onChange={(e) => setUebernacht({ ...uebernacht, pauschale: e.target.value })} /></div>
-          </div>
-          <div style={{ fontSize: 12, color: TOKENS.textMut }}>
-            Zwischensumme: <span style={{ fontWeight: 600, color: TOKENS.text }}>{fmt(sumUebernacht)}</span>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Sonstige Auslagen */}
-      <div style={{ height: 18 }} />
-      <Card>
-        <CardHeader>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-            <CardTitle>Sonstige Auslagen</CardTitle>
-            <Button variant="secondary" onClick={() => setAuslagen((a) => [...a, { id: Date.now(), text: "", betrag: "" }])}>+ Position</Button>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div style={{ display: "grid", gap: 24 }}>
-            {auslagen.map((r) => (
-              <div key={r.id} style={{ display: "grid", gridTemplateColumns: cols(6, 3, 1), columnGap: colGap, rowGap: 24 }}>
-                <div style={{ gridColumn: isDesktop(width) ? "span 4" : isTablet(width) ? "span 2" : "span 1" }}>
-                  <Label>Bezeichnung</Label>
-                  <Input placeholder="z.B. Smart Charge" value={r.text} onChange={(e) => setAuslagen((a) => a.map((x) => (x.id === r.id ? { ...x, text: e.target.value } : x)))} />
-                </div>
-                <div style={{ gridColumn: isDesktop(width) ? "span 2" : "span 1" }}>
-                  <Label>Betrag (€)</Label>
-                  <Input inputMode="decimal" placeholder="0,00" value={r.betrag} onChange={(e) => setAuslagen((a) => a.map((x) => (x.id === r.id ? { ...x, betrag: e.target.value } : x)))} />
-                </div>
-                {auslagen.length > 1 && (
-                  <div style={{ gridColumn: "1 / -1", marginTop: -4 }}>
-                    <Button variant="secondary" onClick={() => delAuslage(r.id)}>Entfernen</Button>
-                  </div>
-                )}
-              </div>
-            ))}
-            <div style={{ fontSize: 12, color: TOKENS.textMut }}>
-              Zwischensumme: <span style={{ fontWeight: 600, color: TOKENS.text }}>{fmt(sumAuslagen)}</span>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Belege */}
-      <div style={{ height: 18 }} />
-      <Card>
-        <CardHeader><CardTitle>Belege hochladen</CardTitle></CardHeader>
-        <CardContent>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <Input id="file" type="file" multiple accept="image/*,application/pdf" onChange={handleFileInputChange} style={{ maxWidth: 480 }} />
-            <div style={{ fontSize: 12, color: TOKENS.textMut }}>Bilder & PDFs werden komprimiert und jeweils seitenfüllend auf DIN A4 angehängt.</div>
-          </div>
-          <div
-            ref={dropRef}
-            onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); }}
-            onDragLeave={(e) => { e.preventDefault(); e.stopPropagation(); if (dropRef.current && !dropRef.current.contains(e.relatedTarget)) setIsDragging(false); }}
-            onDrop={async (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); if (e.dataTransfer?.files?.length) await handleFiles(e.dataTransfer.files); }}
-            style={{ marginTop: 8, border: `2px dashed ${isDragging ? TOKENS.focus : TOKENS.border}`, background: isDragging ? "rgba(37,99,235,0.06)" : "#fff", borderRadius: TOKENS.radius, padding: 24, textAlign: "center", color: TOKENS.textDim, transition: "all .15s ease" }}
-          >
-            {isDragging ? "Dateien hierher loslassen…" : "…oder Dateien hierher ziehen und ablegen (Bilder, PDFs)"}
-          </div>
-          {attachments.length > 0 && (
-            <div style={{ display: "grid", gridTemplateColumns: isDesktop(width) ? "repeat(4,1fr)" : isTablet(width) ? "repeat(3,1fr)" : "repeat(2,1fr)", columnGap: colGap, rowGap: 24 }}>
-              {attachments.map((att, i) => (
-                <div key={i} style={{ border: `1px solid ${TOKENS.border}`, borderRadius: TOKENS.radius, padding: 10, display: "grid", alignItems: "center", justifyItems: "center", gridTemplateRows: "1fr", aspectRatio: "1 / 1", overflow: "hidden", position: "relative", background: "#fff" }}>
-                  <Button variant="ghost" onClick={() => removeAttachment(i)} title="Beleg entfernen" ariaLabel={`Anhang ${att.name} entfernen`} style={{ position: "absolute", top: 8, right: 8, height: 30, padding: "0 10px", borderRadius: 10, backdropFilter: "blur(2px)" }}>Entfernen ✕</Button>
-                  {att.kind === "image" ? (
-                    <img src={att.dataUrl} alt={att.name} style={{ objectFit: "contain", maxWidth: "100%", maxHeight: "100%", width: "auto", height: "auto", placeSelf: "center" }} />
-                  ) : (
-                    <div style={{ textAlign: "center", fontSize: 12, color: TOKENS.textDim, padding: 8, placeSelf: "center" }}>
-                      📄
-                      <div style={{ marginTop: 6, wordBreak: "break-word" }}>{att.name}</div>
-                      <div style={{ marginTop: 6, fontSize: 11, color: TOKENS.textMut }}>PDF wird beim Export gerendert</div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Summary */}
-      <div style={{ height: 18 }} />
-      <Card>
-        <CardHeader><CardTitle>Gesamtsumme</CardTitle></CardHeader>
-        <CardContent>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 18, fontWeight: 700 }}>{fmt(gesamt)}</div>
-            <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-              <Button onClick={generatePDF} disabled={busy || !basisOk}>{busy ? "⏳ Erzeuge PDF…" : "⬇️ PDF erzeugen"}</Button>
-              <Button variant="secondary" onClick={() => {
-                const kw = basis.kw || "XX";
-                const mailtoLink = `mailto:rechnungswesen@tritos-consulting.com?subject=${encodeURIComponent(`Reisekosten KW ${kw}`)}&body=${encodeURIComponent("Bitte die PDF-Reisekostenabrechnung im Anhang einfügen.")}`;
-                window.location.href = mailtoLink;
-              }}>📧 Email</Button>
-              {pdfUrl && (
-                <>
-                  <a href={pdfUrl} target="_blank" rel="noreferrer" style={{ textDecoration: "none", fontSize: 14 }}>Vorschau öffnen</a>
-                  <a href={pdfUrl} download={`Reisekosten_${basis.name || "Mitarbeiter"}_KW${(basis.kw || "XX").replace("/", "-")}.pdf`} style={{ textDecoration: "none", fontSize: 14 }}>PDF herunterladen</a>
-                </>
-              )}
-            </div>
-          </div>
-          {errMsg && <div style={{ marginTop: 8, color: "#DC2626" }}>{errMsg}</div>}
-        </CardContent>
-      </Card>
-
-      {/* Printable area (Deckblatt-Screenshot) */}
-      <div ref={printableRef} style={{ width: 794, padding: 24, fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"', backgroundColor: "#ffffff", color: "#000000", lineHeight: 1.35, marginTop: 24 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div>
-            <div style={{ fontSize: 12 }}>{basis.firma}</div>
-            <div style={{ fontSize: 20, fontWeight: 700, marginTop: 8 }}>Reisekostenabrechnung</div>
-            <div style={{ marginTop: 4, fontSize: 12 }}>
-              {basis.kw ? `KW ${basis.kw}` : null}
-              {basis.kw && (basis.name || basis.beginn || basis.ende) ? " – " : null}
-              {basis.name}
-            </div>
-          </div>
-          <div style={{ width: 90, height: 28 }} />
-        </div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginTop: 16, fontSize: 12 }}>
-          <div><div><span style={{ fontWeight: 600 }}>Name:</span> {basis.name}</div><div><span style={{ fontWeight: 600 }}>Zweck:</span> {basis.zweck}</div></div>
-          <div><div><span style={{ fontWeight: 600 }}>Beginn:</span> {basis.beginn}</div><div><span style={{ fontWeight: 600 }}>Ende:</span> {basis.ende}</div></div>
-        </div>
-
-        {(() => {
-          const cell = { border: "1px solid #000", padding: 8, fontSize: 12, verticalAlign: "top" };
-          const header = { fontWeight: 700, marginTop: 16 };
-          const amtCell = { ...cell, textAlign: "right", width: 110 };
-          const textCell = { ...cell };
-
-          const km = num(fahrt.km);
-          const kmCost = kmFlatCost(km, 0.30);
-
-          const abzugFr = num(verpf.fruehstueckAbz) * num(verpf.abzFruehstueck);
-          const abzugMi = num(verpf.mittagAbz) * num(verpf.abzMittag);
-          const abzugAb = num(verpf.abendAbz) * num(verpf.abzAbend);
-
-          return (
-            <>
-              <div style={header}>Fahrtkosten</div>
-              <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
-                <colgroup><col /><col /><col /><col /><col style={{ width: 110 }} /></colgroup>
-                <tbody>
-                  <tr>
-                    <td style={textCell}>Privat-PKW</td>
-                    <td style={textCell}>Kennzeichen: {fahrt.kennzeichen || "—"}</td>
-                    <td style={textCell}>Tachostand: {fahrt.tachostandBeginn || "—"} → {fahrt.tachostandEnde || "—"}</td>
-                    <td style={textCell}>{km} km × 0,30 €/km</td>
-                    <td style={amtCell}>{fmt(kmCost)}</td>
-                  </tr>
-                  <tr><td style={textCell}>Deutsche Bahn</td><td style={textCell} colSpan={3}></td><td style={amtCell}>{fmt(num(fahrt.bahn))}</td></tr>
-                  <tr><td style={textCell}>Taxi</td><td style={textCell} colSpan={3}></td><td style={amtCell}>{fmt(num(fahrt.taxi))}</td></tr>
-                  <tr><td style={textCell}>Öffentliche Verkehrsmittel</td><td style={textCell} colSpan={3}></td><td style={amtCell}>{fmt(num(fahrt.oev))}</td></tr>
-                  <tr><td style={{ ...textCell, fontWeight: 700 }} colSpan={4}>Zwischensumme Fahrtkosten</td><td style={{ ...amtCell, fontWeight: 700 }}>{fmt(sumFahrt)}</td></tr>
-                </tbody>
-              </table>
-
-              <div style={header}>Verpflegungsmehraufwand</div>
-              <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
-                <colgroup><col /><col /><col /><col /><col style={{ width: 110 }} /></colgroup>
-                <tbody>
-                  <tr>
-                    <td style={textCell}>Tage &gt; 8 Std.</td>
-                    <td style={textCell}>{verpf.tage8}</td>
-                    <td style={textCell}>Satz {fmt(num(verpf.satz8))}</td>
-                    <td style={textCell}></td>
-                    <td style={amtCell}>{fmt(num(verpf.tage8) * num(verpf.satz8))}</td>
-                  </tr>
-                  <tr>
-                    <td style={textCell}>Tage 24 Std.</td>
-                    <td style={textCell}>{verpf.tage24}</td>
-                    <td style={textCell}>Satz {fmt(num(verpf.satz24))}</td>
-                    <td style={textCell}></td>
-                    <td style={amtCell}>{fmt(num(verpf.tage24) * num(verpf.satz24))}</td>
-                  </tr>
-
-                  {/* Abzüge (werden angezeigt, auch wenn Wert 0 ist – kann auf Wunsch dynamisch ausgeblendet werden) */}
-                  <tr>
-                    <td style={textCell}>abzgl. Frühstück</td>
-                    <td style={textCell}>{verpf.fruehstueckAbz}</td>
-                    <td style={textCell}>{fmt(num(verpf.abzFruehstueck))} pro Frühstück</td>
-                    <td style={textCell}></td>
-                    <td style={amtCell}>- {fmt(abzugFr)}</td>
-                  </tr>
-                  <tr>
-                    <td style={textCell}>abzgl. Mittagessen</td>
-                    <td style={textCell}>{verpf.mittagAbz}</td>
-                    <td style={textCell}>{fmt(num(verpf.abzMittag))} pro Mittagessen</td>
-                    <td style={textCell}></td>
-                    <td style={amtCell}>- {fmt(abzugMi)}</td>
-                  </tr>
-                  <tr>
-                    <td style={textCell}>abzgl. Abendessen</td>
-                    <td style={textCell}>{verpf.abendAbz}</td>
-                    <td style={textCell}>{fmt(num(verpf.abzAbend))} pro Abendessen</td>
-                    <td style={textCell}></td>
-                    <td style={amtCell}>- {fmt(abzugAb)}</td>
-                  </tr>
-
-                  <tr>
-                    <td style={{ ...textCell, fontWeight: 700 }} colSpan={4}>Zwischensumme</td>
-                    <td style={{ ...amtCell, fontWeight: 700 }}>{fmt(sumVerpf)}</td>
-                  </tr>
-                </tbody>
-              </table>
-
-              <div style={header}>Übernachtungskosten</div>
-              <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
-                <colgroup><col /><col /><col /><col /><col style={{ width: 110 }} /></colgroup>
-                <tbody>
-                  <tr><td style={textCell}>Tatsächliche Kosten (ohne Verpflegung)</td><td style={textCell} colSpan={3}></td><td style={amtCell}>{fmt(num(uebernacht.tatsaechlich))}</td></tr>
-                  <tr><td style={textCell}>Pauschale</td><td style={textCell} colSpan={3}></td><td style={amtCell}>{fmt(num(uebernacht.pauschale))}</td></tr>
-                  <tr><td style={{ ...textCell, fontWeight: 700 }} colSpan={4}>Zwischensumme</td><td style={{ ...amtCell, fontWeight: 700 }}>{fmt(sumUebernacht)}</td></tr>
-                </tbody>
-              </table>
-
-              <div style={header}>Sonstige Auslagen</div>
-              <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8, tableLayout: "fixed" }}>
-                <colgroup><col /><col /><col /><col /><col style={{ width: 110 }} /></colgroup>
-                <tbody>
-                  {auslagen.map((r, i) => (
-                    <tr key={i}><td style={textCell} colSpan={4}>{r.text || "—"}</td><td style={amtCell}>{fmt(num(r.betrag))}</td></tr>
-                  ))}
-                  <tr><td style={{ ...textCell, fontWeight: 700 }} colSpan={4}>Zwischensumme</td><td style={{ ...amtCell, fontWeight: 700 }}>{fmt(sumAuslagen)}</td></tr>
-                </tbody>
-              </table>
-
-              <div style={{ textAlign: "right", marginTop: 16, fontWeight: 700, fontSize: 14 }}>
-                Gesamte Reisekosten: {fmt(gesamt)}
-              </div>
-            </>
-          );
-        })()}
-      </div>
-
-      <div style={{ fontSize: 12, color: TOKENS.textMut, marginTop: 8 }}>
-        📷 Tipp: Bilder & PDFs hier hochladen – sie landen automatisch (komprimiert) in der Export-PDF. Du kannst Dateien auch in das Feld ziehen.
-      </div>
-
-      {testOutput.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <Card>
-            <CardHeader><CardTitle>Testergebnisse</CardTitle></CardHeader>
-            <CardContent>
-              <ul style={{ display: "grid", gap: 6, fontSize: 14, margin: 0, paddingLeft: 16 }}>
-                {testOutput.map((t, i) => (
-                  <li key={i} style={{ color: t.ok ? "#059669" : "#DC2626" }}>
-                    {t.ok ? "✔" : "✖"} {t.name} {t.msg ? `– ${t.msg}` : ""}
-                  </li>
-                ))}
-              </ul>
-            </CardContent>
-          </Card>
-        </div>
-      )}
-    </div>
-  );
-}
+        <
