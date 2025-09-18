@@ -185,7 +185,7 @@ export default function TravelExpenseFormDE() {
 
   // Basis
   const [basis, setBasis] = useState({
-    name: "",
+    name: "Kromer Tobias",
     zweck: "",
     beginn: "",
     ende: "",
@@ -310,7 +310,6 @@ export default function TravelExpenseFormDE() {
 
   // ------- DATEV Stempel/Properties (nur Seite 1) -------
   function applyDatevMetadata(pdf, title, amountNumber, partnerLastFirst, invoiceDateDE) {
-    // PDF-Info
     try {
       pdf.setProperties({
         title,
@@ -321,7 +320,6 @@ export default function TravelExpenseFormDE() {
       });
       if (pdf.setCreationDate) pdf.setCreationDate(new Date());
     } catch {}
-    // sichtbarer Text wird NICHT hier, sondern direkt im Layout der Seite 1 gedruckt
   }
 
   async function renderPdfFileToImages(file) {
@@ -345,7 +343,7 @@ export default function TravelExpenseFormDE() {
     return pages;
   }
 
-  // ------- PDF-Erzeugung (JETZT VOR return!) -------
+  // ------- PDF-Erzeugung (Metadaten unten, klein & grau) -------
   const generatePDF = async () => {
     setErrMsg("");
     setPdfUrl("");
@@ -366,44 +364,57 @@ export default function TravelExpenseFormDE() {
 
       const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
 
-      // Seite 1: oben DATEV-Block, rechts Logo, darunter Formularbild
       const pageW = pdf.internal.pageSize.getWidth();
       const pageH = pdf.internal.pageSize.getHeight();
       const margin = 24;
 
-      // --- sichtbarer DATEV-Block (nur Seite 1, oben) ---
-      const docTitle = `Reisekosten ${basis.name || "Mitarbeiter"} ${String(basis.kw || "XX").replace("/", "-")}`;
-      const partner = toLastNameFirst(basis.name);
+      // Sichtbare Metadaten (nur 2 Zeilen) -> unten, klein, grau
       const invoiceDate = formatDateDE(new Date());
-      const amountStr = fmt(gesamt); // z.B. 1.234,56 €
+      const amountStr = fmt(gesamt);
 
-      pdf.setFontSize(11);
-      pdf.setTextColor(20);
-      let y = margin + 6;
-      pdf.text(`Rechnungsbetrag: ${amountStr}`, margin, y); y += 16;
-      pdf.text(`Geschäftspartner: ${partner}`, margin, y); y += 16;
-      pdf.text(`Rechnungsdatum: ${invoiceDate}`, margin, y); y += 16;
-      pdf.text(`Titel: ${docTitle}`, margin, y); y += 12;
+      const metaFontSize = 9;     // klein
+      const metaLine = 12;        // kleinere Schrittgröße (Zeilenabstand)
+      const metaColorGray = 130;  // hellgrau
+      const metaLines = [
+        `Rechnungsbetrag: ${amountStr}`,
+        `Rechnungsdatum: ${invoiceDate}`,
+      ];
+      const metaBlockHeight = metaLine * metaLines.length;
 
-      // Logo oben rechts (kollisionsfrei)
+      // Logo oben rechts (optional)
       if (logoImg) {
         const x = pageW - LOGO_RIGHT - LOGO_W;
         pdf.addImage(logoImg, "PNG", x, margin, LOGO_W, LOGO_H);
       }
 
-      // Hauptformular-Bild unterhalb des DATEV-Blocks einpassen
-      const availableTop = y + 10; // etwas Abstand
-      const availableH = pageH - availableTop - margin;
-      const imgMain = canvas.toDataURL("image/jpeg", JPG_QUALITY_MAIN);
+      // Hauptformular-Bild: Platz bis knapp über Metablock; wenn Logo vorhanden, unter Logo einsteigen
+      const topOffset = logoImg ? LOGO_H + 10 : 0; // Kollisionsvermeidung mit Logo
+      const availableTop = margin + topOffset;
+      const availableBottom = pageH - margin - metaBlockHeight - 6; // kleiner Abstand über Metablock
+      const availableH = Math.max(0, availableBottom - availableTop);
 
-      // Bildgröße berechnen
+      const imgMain = canvas.toDataURL("image/jpeg", JPG_QUALITY_MAIN);
       const innerW = pageW - margin * 2;
       const ratio = Math.min(innerW / canvas.width, availableH / canvas.height);
       const w = canvas.width * ratio;
       const h = canvas.height * ratio;
-      pdf.addImage(imgMain, "JPEG", (pageW - w) / 2, availableTop, w, h, undefined, "FAST");
+      const imgX = (pageW - w) / 2;
+      const imgY = availableTop;
 
-      // PDF-Properties setzen (nur 1x)
+      pdf.addImage(imgMain, "JPEG", imgX, imgY, w, h, undefined, "FAST");
+
+      // Metablock unten links
+      pdf.setFontSize(metaFontSize);
+      pdf.setTextColor(metaColorGray);
+      let y = pageH - margin - metaBlockHeight + metaFontSize;
+      for (const line of metaLines) {
+        pdf.text(line, margin, y);
+        y += metaLine;
+      }
+
+      // Unsichtbare PDF-Properties (weiterhin gesetzt)
+      const docTitle = `Reisekosten ${basis.name || "Mitarbeiter"} ${String(basis.kw || "XX").replace("/", "-")}`;
+      const partner = toLastNameFirst(basis.name);
       applyDatevMetadata(pdf, docTitle, gesamt, partner, invoiceDate);
 
       // ---- Anhänge (ein Bild/Seite oder PDF-Seite/Seite) ----
