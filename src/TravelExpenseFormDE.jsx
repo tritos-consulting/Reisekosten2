@@ -1,19 +1,20 @@
+// src/TravelExpenseFormDE.jsx
 import React, { useMemo, useRef, useState, useEffect } from "react";
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
 
 /**
- * Features:
- * - Pflichtfelder in Basisdaten (PDF-Button erst aktiv)
+ * Features (Kurz):
+ * - Pflichtfelder in Basisdaten
  * - KW automatisch aus Beginn (optional)
  * - KM automatisch aus Tachostand
- * - Fahrtkosten 0,30 €/km (flach)
+ * - Fahrtkosten 0,30 €/km
  * - Verpflegungsmehraufwand mit ausklappbaren Abzügen (Frühstück/Mittag/Abend)
  * - Sonstige Auslagen (dynamisch)
  * - Belege: Bilder & PDFs, Drag&Drop, Entfernen
- * - PDF: Deckblatt (Screenshot), Logo auf erster Seite, Anhänge seitenfüllend
+ * - PDF: Deckblatt-Screenshot + Logo auf Seite 1, Anhänge seitenfüllend
  * - Komprimierte Bilder für kleine PDF-Dateien
- * - DATEV: PDF-Properties (Title/Subject) + maschinenlesbarer Stempel „TITEL:“ / „GESAMTBETRAG:“
+ * - DATEV: sichtbare Angaben auf Seite 1 + PDF-Properties
  */
 
 // --------- Design Tokens ----------
@@ -98,6 +99,20 @@ function kwIsoFromDateStr(dateStr) {
 }
 function kmFlatCost(km, rate = 0.30) { return Math.max(0, num(km)) * rate; }
 
+// Datum & Namen für DATEV
+function formatDateDE(d = new Date()) {
+  return d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" });
+}
+/** Eingabe: "Vorname Nachname" -> Ausgabe: "Nachname, Vorname"; bei einem Wort: dieses Wort */
+function toLastNameFirst(fullName) {
+  if (!fullName) return "";
+  const parts = fullName.trim().split(/\s+/);
+  if (parts.length <= 1) return parts[0];
+  const first = parts[0];
+  const last = parts.slice(1).join(" ");
+  return `${last}, ${first}`;
+}
+
 // --- Kompression ---
 const TARGET_IMG_PX = 1360;
 const JPG_QUALITY_MAIN = 0.78;
@@ -170,7 +185,7 @@ export default function TravelExpenseFormDE() {
 
   // Basis
   const [basis, setBasis] = useState({
-    name: "",
+    name: "Kromer Tobias",
     zweck: "",
     beginn: "",
     ende: "",
@@ -253,7 +268,7 @@ export default function TravelExpenseFormDE() {
   // Handlers
   const addAuslage = () => setAuslagen((a) => [...a, { id: Date.now(), text: "", betrag: "" }]);
   const delAuslage = (id) => setAuslagen((a) => a.filter((x) => x.id !== id));
-
+  
   const handleFiles = async (filesList) => {
     const files = Array.from(filesList || []);
     const next = [];
@@ -274,159 +289,6 @@ export default function TravelExpenseFormDE() {
   const onDragLeave = (e) => { e.preventDefault(); e.stopPropagation(); if (dropRef.current && !dropRef.current.contains(e.relatedTarget)) setIsDragging(false); };
   const onDrop = async (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); if (e.dataTransfer?.files?.length) await handleFiles(e.dataTransfer.files); };
 
-  async function renderPdfFileToImages(file) {
-    const pdfjsLib = await ensurePdfJs();
-    const ab = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
-    const pages = [];
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const vp1 = page.getViewport({ scale: 1 });
-      const aspect = vp1.height / vp1.width;
-      const targetW = TARGET_IMG_PX;
-      const scale = targetW / vp1.width;
-      const viewport = page.getViewport({ scale });
-      const canvas = document.createElement("canvas");
-      canvas.width = targetW;
-      canvas.height = Math.round(targetW * aspect);
-      await page.render({ canvasContext: canvas.getContext("2d"), viewport, intent: "print" }).promise;
-      pages.push({ dataUrl: canvas.toDataURL("image/jpeg", JPG_QUALITY_ATTACH), aspect });
-    }
-    return pages;
-  }
-
-  // ------- DATEV Stempel/Properties -------
-  function applyDatevMetadata(pdf, title, amountNumber) {
-    // PDF-Info / Document Properties
-    try {
-      pdf.setProperties({
-        title,
-        subject: title,
-        author: basis.name || "",
-        keywords: `DATEV;Reisekosten;Gesamtbetrag=${amountNumber?.toFixed(2) ?? "0.00"}`,
-        creator: "Reisekosten Webformular",
-      });
-      // Creation date (optional)
-      if (pdf.setCreationDate) pdf.setCreationDate(new Date());
-    } catch {}
-
-    // Maschinenlesbarer Text-Stempel (dezent sichtbar)
-    try {
-      const pageW = pdf.internal.pageSize.getWidth();
-      const pageH = pdf.internal.pageSize.getHeight();
-      pdf.setFontSize(9);
-      pdf.setTextColor(100); // dezentes Grau, aber gut auslesbar
-      // Einheitliche, leicht parsbare Schlüsselwörter:
-      // TITEL: ...  |  GESAMTBETRAG: 1234.56 EUR (Punkt als Dezimaltrenner ist oft robuster)
-      const asciiAmount = (Number(amountNumber || 0)).toFixed(2); // 1234.56
-      pdf.text(`TITEL: ${title}`, 12, pageH - 22);
-      pdf.text(`GESAMTBETRAG: ${asciiAmount} EUR`, 12, pageH - 10);
-    } catch {}
-  }
-
-  // ------- PDF-Erzeugung -------
-  const generatePDF = async () => {
-    setErrMsg("");
-    setPdfUrl("");
-    try {
-      const node = printableRef.current;
-      if (!node) return;
-      setBusy(true);
-
-      // Offscreen rendern für html2canvas
-      const prev = { position: node.style.position, left: node.style.left, top: node.style.top, opacity: node.style.opacity, pointerEvents: node.style.pointerEvents };
-      node.style.position = "absolute"; node.style.left = "-10000px"; node.style.top = "0"; node.style.opacity = "1"; node.style.pointerEvents = "none";
-
-      const canvas = await html2canvas(node, { scale: 1.3, useCORS: true, backgroundColor: "#ffffff", imageTimeout: 15000 });
-      Object.assign(node.style, prev);
-
-      // Logo laden (optional)
-      const logoImg = await new Promise((resolve) => { const img = new Image(); img.onload = () => resolve(img); img.onerror = () => resolve(null); img.src = LOGO_SRC; });
-
-      const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
-
-      // Hauptseite einpassen (A4 mit Rand)
-      const pageW = pdf.internal.pageSize.getWidth();
-      const pageH = pdf.internal.pageSize.getHeight();
-      const margin = 24;
-      const innerW = pageW - margin * 2;
-      const innerH = pageH - margin * 2;
-      const ratio = Math.min(innerW / canvas.width, innerH / canvas.height);
-      const w = canvas.width * ratio;
-      const h = canvas.height * ratio;
-      const imgMain = canvas.toDataURL("image/jpeg", JPG_QUALITY_MAIN);
-      pdf.addImage(imgMain, "JPEG", (pageW - w) / 2, margin, w, h, undefined, "FAST");
-
-      // Logo oben rechts (nur erste Seite)
-      if (logoImg) {
-        const x = pageW - LOGO_RIGHT - LOGO_W;
-        pdf.addImage(logoImg, "PNG", x, margin, LOGO_W, LOGO_H);
-      }
-
-      // ----- DATEV-Metadaten/Stempel auf erster Seite -----
-      const kwForTitle = (basis.kw || "XX").replace("/", "-");
-      const docTitle = `Reisekosten ${basis.name || "Mitarbeiter"} ${kwForTitle}`;
-      applyDatevMetadata(pdf, docTitle, gesamt);
-
-      // ---- Anhänge (ein Bild/Seite oder PDF-Seite/Seite) ----
-      const allImages = [];
-      let pdfRenderFailed = false;
-
-      // Bilder
-      for (const att of attachments) {
-        if (att.kind === "image") {
-          try {
-            const small = await downscaleImage(att.dataUrl, TARGET_IMG_PX, JPG_QUALITY_ATTACH);
-            allImages.push({ dataUrl: small, name: att.name });
-          } catch (e) { console.error("Bildanhang Fehler:", att.name, e); }
-        }
-      }
-      // PDFs
-      for (const att of attachments) {
-        if (att.kind === "pdf") {
-          try {
-            const imgs = await renderPdfFileToImages(att.file);
-            imgs.forEach((img, i) => allImages.push({ dataUrl: img.dataUrl, name: `${att.name} (Seite ${i + 1})` }));
-          } catch (e) { console.error("PDF-Render-Fehler:", att.name, e); pdfRenderFailed = true; }
-        }
-      }
-
-      for (const { dataUrl, name } of allImages) {
-        const dim = await new Promise((resolve) => { const image = new Image(); image.onload = () => resolve({ w: image.width, h: image.height }); image.src = dataUrl; });
-        const isLandscape = dim.h / dim.w < 1;
-        pdf.addPage("a4", isLandscape ? "landscape" : "portrait");
-        const curW = pdf.internal.pageSize.getWidth();
-        const curH = pdf.internal.pageSize.getHeight();
-        const m = 20;
-        const maxW = curW - m * 2;
-        const maxH = curH - m * 2;
-        const s = Math.min(maxW / dim.w, maxH / dim.h);
-        const drawW = dim.w * s;
-        const drawH = dim.h * s;
-        const x = (curW - drawW) / 2;
-        const y = (curH - drawH) / 2;
-        pdf.addImage(dataUrl, "JPEG", x, y, drawW, drawH, undefined, "FAST");
-
-        // Seitenfuß mit Dateinamen
-        pdf.setFontSize(9);
-        pdf.setTextColor(90);
-        pdf.text(name || "Anhang", m, curH - m / 2);
-      }
-
-      const filename = `Reisekosten_${basis.name || "Mitarbeiter"}_KW${(basis.kw || "XX").replace("/", "-")}.pdf`;
-      try { pdf.save(filename, { returnPromise: true }); } catch {}
-      const blob = pdf.output("blob");
-      setPdfUrl(URL.createObjectURL(blob));
-      if (pdfRenderFailed) setErrMsg("Hinweis: Mindestens ein PDF-Anhang konnte nicht gerendert werden. Bilder wurden dennoch exportiert.");
-
-      setBusy(false);
-    } catch (err) {
-      setBusy(false);
-      console.error(err);
-      setErrMsg(`PDF-Erzeugung fehlgeschlagen: ${err?.message || err}`);
-    }
-  };
-
   // Tests (Kurz)
   const runTests = () => {
     const results = [];
@@ -435,8 +297,6 @@ export default function TravelExpenseFormDE() {
     try {
       const n1 = num("1,5"); Math.abs(n1 - 1.5) < 1e-9 ? pass("num('1,5')") : fail("num('1,5')", n1);
       const sf = computeSumFahrt({ km: 100, oev: 10, bahn: 0, taxi: 0 }); Math.abs(sf - 40) < 1e-9 ? pass("Fahrt 100km + 10€") : fail("Fahrt", sf);
-      const sv = computeSumVerpf({ tage8: 2, satz8: 14, tage24: 1, satz24: 28, fruehstueckAbz: 1, abzFruehstueck: 5.6, mittagAbz: 1, abzMittag: 11.2, abendAbz: 1, abzAbend: 11.2 });
-      Math.abs(sv - 28) < 1e-9 ? pass("Verpflegung Abzüge") : fail("Verpflegung Abzüge", sv);
       setTestOutput(results);
     } catch (e) {
       setTestOutput([{ name: "Test runner crashed", ok: false, msg: String(e) }]);
@@ -770,7 +630,6 @@ export default function TravelExpenseFormDE() {
                     <td style={amtCell}>{fmt(num(verpf.tage24) * num(verpf.satz24))}</td>
                   </tr>
 
-                  {/* Abzüge – nur rendern, wenn Anzahl > 0 */}
                   {num(verpf.fruehstueckAbz) > 0 && (
                     <tr>
                       <td style={textCell}>abzgl. Frühstück</td>
@@ -855,4 +714,160 @@ export default function TravelExpenseFormDE() {
       )}
     </div>
   );
+  // ------- DATEV Stempel/Properties (nur Seite 1) -------
+  function applyDatevMetadata(pdf, title, amountNumber, partnerLastFirst, invoiceDateDE) {
+    // PDF-Info
+    try {
+      pdf.setProperties({
+        title,
+        subject: title,
+        author: basis.name || "",
+        keywords: `DATEV;Reisekosten;Rechnungsbetrag=${(Number(amountNumber||0)).toFixed(2)}`,
+        creator: "Reisekosten Webformular",
+      });
+      if (pdf.setCreationDate) pdf.setCreationDate(new Date());
+    } catch {}
+
+    // sichtbarer Text wird NICHT hier, sondern direkt im Layout der Seite 1 gedruckt
+  }
+
+  async function renderPdfFileToImages(file) {
+    const pdfjsLib = await ensurePdfJs();
+    const ab = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
+    const pages = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const vp1 = page.getViewport({ scale: 1 });
+      const aspect = vp1.height / vp1.width;
+      const targetW = TARGET_IMG_PX;
+      const scale = targetW / vp1.width;
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = targetW;
+      canvas.height = Math.round(targetW * aspect);
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport, intent: "print" }).promise;
+      pages.push({ dataUrl: canvas.toDataURL("image/jpeg", JPG_QUALITY_ATTACH), aspect });
+    }
+    return pages;
+  }
+
+  // ------- PDF-Erzeugung -------
+  const generatePDF = async () => {
+    setErrMsg("");
+    setPdfUrl("");
+    try {
+      const node = printableRef.current;
+      if (!node) return;
+      setBusy(true);
+
+      // Offscreen rendern für html2canvas
+      const prev = { position: node.style.position, left: node.style.left, top: node.style.top, opacity: node.style.opacity, pointerEvents: node.style.pointerEvents };
+      node.style.position = "absolute"; node.style.left = "-10000px"; node.style.top = "0"; node.style.opacity = "1"; node.style.pointerEvents = "none";
+
+      const canvas = await html2canvas(node, { scale: 1.3, useCORS: true, backgroundColor: "#ffffff", imageTimeout: 15000 });
+      Object.assign(node.style, prev);
+
+      // Logo laden (optional)
+      const logoImg = await new Promise((resolve) => { const img = new Image(); img.onload = () => resolve(img); img.onerror = () => resolve(null); img.src = LOGO_SRC; });
+
+      const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
+
+      // Seite 1: oben DATEV-Block, rechts Logo, darunter Formularbild
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const margin = 24;
+
+      // --- sichtbarer DATEV-Block (nur Seite 1, oben) ---
+      const docTitle = `Reisekosten ${basis.name || "Mitarbeiter"} ${String(basis.kw || "XX").replace("/", "-")}`;
+      const partner = toLastNameFirst(basis.name);
+      const invoiceDate = formatDateDE(new Date());
+      const amountStr = fmt(gesamt); // z.B. 1.234,56 €
+
+      pdf.setFontSize(11);
+      pdf.setTextColor(20);
+      let y = margin + 6;
+      pdf.text(`Rechnungsbetrag: ${amountStr}`, margin, y); y += 16;
+      pdf.text(`Geschäftspartner: ${partner}`, margin, y); y += 16;
+      pdf.text(`Rechnungsdatum: ${invoiceDate}`, margin, y); y += 16;
+      pdf.text(`Titel: ${docTitle}`, margin, y); y += 12;
+
+      // Logo oben rechts (kollisionsfrei)
+      if (logoImg) {
+        const x = pageW - LOGO_RIGHT - LOGO_W;
+        pdf.addImage(logoImg, "PNG", x, margin, LOGO_W, LOGO_H);
+      }
+
+      // Hauptformular-Bild unterhalb des DATEV-Blocks einpassen
+      const availableTop = y + 10; // etwas Abstand
+      const availableH = pageH - availableTop - margin;
+      const imgMain = canvas.toDataURL("image/jpeg", JPG_QUALITY_MAIN);
+
+      // Bildgröße berechnen
+      const innerW = pageW - margin * 2;
+      const ratio = Math.min(innerW / canvas.width, availableH / canvas.height);
+      const w = canvas.width * ratio;
+      const h = canvas.height * ratio;
+      pdf.addImage(imgMain, "JPEG", (pageW - w) / 2, availableTop, w, h, undefined, "FAST");
+
+      // PDF-Properties setzen (nur 1x)
+      applyDatevMetadata(pdf, docTitle, gesamt, partner, invoiceDate);
+
+      // ---- Anhänge (ein Bild/Seite oder PDF-Seite/Seite) ----
+      const allImages = [];
+      let pdfRenderFailed = false;
+
+      // Bilder
+      for (const att of attachments) {
+        if (att.kind === "image") {
+          try {
+            const small = await downscaleImage(att.dataUrl, TARGET_IMG_PX, JPG_QUALITY_ATTACH);
+            allImages.push({ dataUrl: small, name: att.name });
+          } catch (e) { console.error("Bildanhang Fehler:", att.name, e); }
+        }
+      }
+      // PDFs
+      for (const att of attachments) {
+        if (att.kind === "pdf") {
+          try {
+            const imgs = await renderPdfFileToImages(att.file);
+            imgs.forEach((img, i) => allImages.push({ dataUrl: img.dataUrl, name: `${att.name} (Seite ${i + 1})` }));
+          } catch (e) { console.error("PDF-Render-Fehler:", att.name, e); pdfRenderFailed = true; }
+        }
+      }
+
+      // Einfügen der Anhänge (ab Seite 2)
+      for (const { dataUrl, name } of allImages) {
+        const dim = await new Promise((resolve) => { const image = new Image(); image.onload = () => resolve({ w: image.width, h: image.height }); image.src = dataUrl; });
+        const isLandscape = dim.h / dim.w < 1;
+        pdf.addPage("a4", isLandscape ? "landscape" : "portrait");
+        const curW = pdf.internal.pageSize.getWidth();
+        const curH = pdf.internal.pageSize.getHeight();
+        const m = 20;
+        const maxW = curW - m * 2;
+        const maxH = curH - m * 2;
+        const s = Math.min(maxW / dim.w, maxH / dim.h);
+        const drawW = dim.w * s;
+        const drawH = dim.h * s;
+        const x = (curW - drawW) / 2;
+        const y2 = (curH - drawH) / 2;
+        pdf.addImage(dataUrl, "JPEG", x, y2, drawW, drawH, undefined, "FAST");
+
+        pdf.setFontSize(9);
+        pdf.setTextColor(90);
+        pdf.text(name || "Anhang", m, curH - m / 2);
+      }
+
+      const filename = `Reisekosten_${basis.name || "Mitarbeiter"}_KW${(basis.kw || "XX").replace("/", "-")}.pdf`;
+      try { pdf.save(filename, { returnPromise: true }); } catch {}
+      const blob = pdf.output("blob");
+      setPdfUrl(URL.createObjectURL(blob));
+      if (pdfRenderFailed) setErrMsg("Hinweis: Mindestens ein PDF-Anhang konnte nicht gerendert werden. Bilder wurden dennoch exportiert.");
+      setBusy(false);
+    } catch (err) {
+      setBusy(false);
+      console.error(err);
+      setErrMsg(`PDF-Erzeugung fehlgeschlagen: ${err?.message || err}`);
+    }
+  };
 }
